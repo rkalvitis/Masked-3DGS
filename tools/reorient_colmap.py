@@ -390,7 +390,7 @@ def compute_alignment(points: Dict[int, Point3D], images: Dict[int, Image]) -> n
             f"[alignment] Tail-light median projection along +X: {tail_proj:.4f} "
             f"(red candidates={tail_count})"
         )
-        if tail_proj < 0:
+        if tail_proj > 0:
             x_axis = -x_axis
             print(
                 "[alignment] Tail-light heuristic flipped x-axis so +X points toward vehicle front."
