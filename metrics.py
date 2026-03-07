@@ -18,20 +18,26 @@ from utils.loss_utils import ssim
 from lpipsPyTorch import lpips
 import json
 from tqdm import tqdm
-from utils.image_utils import psnr
+from utils.image_utils import psnr, masked_psnr
 from argparse import ArgumentParser
 
-def readImages(renders_dir, gt_dir):
+def readImages(renders_dir, gt_dir, masks_dir=None):
     renders = []
     gts = []
+    masks = []
     image_names = []
     for fname in os.listdir(renders_dir):
         render = Image.open(renders_dir / fname)
         gt = Image.open(gt_dir / fname)
         renders.append(tf.to_tensor(render).unsqueeze(0)[:, :3, :, :].cuda())
         gts.append(tf.to_tensor(gt).unsqueeze(0)[:, :3, :, :].cuda())
+        if masks_dir is not None and (masks_dir / fname).exists():
+            mask = Image.open(masks_dir / fname)
+            masks.append(tf.to_tensor(mask).unsqueeze(0)[:, :1, :, :].cuda())
+        else:
+            masks.append(None)
         image_names.append(fname)
-    return renders, gts, image_names
+    return renders, gts, masks, image_names
 
 def evaluate(model_paths):
 
@@ -62,16 +68,27 @@ def evaluate(model_paths):
                 method_dir = test_dir / method
                 gt_dir = method_dir/ "gt"
                 renders_dir = method_dir / "renders"
-                renders, gts, image_names = readImages(renders_dir, gt_dir)
+                masks_dir = method_dir / "masks"
+                if not masks_dir.exists():
+                    masks_dir = None
+                renders, gts, masks, image_names = readImages(renders_dir, gt_dir, masks_dir)
 
                 ssims = []
                 psnrs = []
                 lpipss = []
 
                 for idx in tqdm(range(len(renders)), desc="Metric evaluation progress"):
-                    ssims.append(ssim(renders[idx], gts[idx]))
-                    psnrs.append(psnr(renders[idx], gts[idx]))
-                    lpipss.append(lpips(renders[idx], gts[idx], net_type='vgg'))
+                    if masks[idx] is not None:
+                        mask = masks[idx]
+                        masked_render = renders[idx] * mask
+                        masked_gt = gts[idx] * mask
+                        ssims.append(ssim(masked_render, masked_gt))
+                        psnrs.append(masked_psnr(renders[idx].squeeze(0), gts[idx].squeeze(0), mask.squeeze(0)))
+                        lpipss.append(lpips(masked_render, masked_gt, net_type='vgg'))
+                    else:
+                        ssims.append(ssim(renders[idx], gts[idx]))
+                        psnrs.append(psnr(renders[idx], gts[idx]))
+                        lpipss.append(lpips(renders[idx], gts[idx], net_type='vgg'))
 
                 print("  SSIM : {:>12.7f}".format(torch.tensor(ssims).mean(), ".5"))
                 print("  PSNR : {:>12.7f}".format(torch.tensor(psnrs).mean(), ".5"))

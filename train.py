@@ -21,7 +21,7 @@ from scene import Scene, GaussianModel
 from utils.general_utils import safe_state, get_expon_lr_func
 import uuid
 from tqdm import tqdm
-from utils.image_utils import psnr
+from utils.image_utils import psnr, masked_psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
 from utils.add_shadow_gaussians import add_shadow_gaussians_to_ply
@@ -138,7 +138,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             mask_regularizer = opt.lambda_mask * (inside_alpha_loss + outside_alpha_loss + outside_rgb_loss)
             loss = loss + mask_regularizer
 
-        Ll1 = l1_loss(masked_image, masked_gt_image)
+        if mask is not None:
+            mask_sum = mask.sum().clamp(min=1.0)
+            Ll1 = (torch.abs(image - gt_image) * mask).sum() / mask_sum
+        else:
+            Ll1 = l1_loss(image, gt_image)
+        # SSIM uses multiplicative masking — acceptable since SSIM is a windowed metric
         if FUSED_SSIM_AVAILABLE:
             ssim_value = fused_ssim(masked_image.unsqueeze(0), masked_gt_image.unsqueeze(0))
         else:
@@ -150,20 +155,23 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # Depth regularization
         Ll1depth_pure = 0.0
         if depth_l1_weight(iteration) > 0 and viewpoint_cam.depth_reliable:
-            invDepth = render_pkg["depth"]  # Maybe delete later
-            # render_depth = render_pkg["depth"]
-            # if render_depth.ndim == 2:
-            #     render_depth = render_depth.unsqueeze(0)
+            render_depth = render_pkg["depth"]
+            if render_depth.ndim == 2:
+                render_depth = render_depth.unsqueeze(0)
 
-            # inv_depth = torch.zeros_like(render_depth)
-            # valid_depth = render_depth > 1e-6
-            # inv_depth[valid_depth] = torch.reciprocal(torch.clamp(render_depth[valid_depth], min=1e-6))
+            # Convert rendered linear depth to inverse depth to match GT
+            invDepth = torch.zeros_like(render_depth)
+            valid_depth = render_depth > 1e-6
+            invDepth[valid_depth] = 1.0 / render_depth[valid_depth]
 
             mono_invdepth = viewpoint_cam.invdepthmap.cuda()
             depth_mask = viewpoint_cam.depth_mask.cuda()
 
-            Ll1depth_pure = torch.abs((invDepth - mono_invdepth) * depth_mask).mean()
-            Ll1depth = depth_l1_weight(iteration) * Ll1depth_pure 
+            # Only compute loss over valid depth pixels
+            combined_mask = depth_mask * valid_depth.float()
+            depth_mask_sum = combined_mask.sum().clamp(min=1.0)
+            Ll1depth_pure = (torch.abs(invDepth - mono_invdepth) * combined_mask).sum() / depth_mask_sum
+            Ll1depth = depth_l1_weight(iteration) * Ll1depth_pure
             loss += Ll1depth
             Ll1depth = Ll1depth.item()
         else:
@@ -334,18 +342,17 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                         gt_image = gt_image[..., gt_image.shape[-1] // 2:]
                         if mask is not None:
                             mask = mask[..., mask.shape[-1] // 2:]
-                    if mask is not None:
-                        masked_render = render_image * mask
-                        masked_gt = gt_image * mask
-                    else:
-                        masked_render = render_image
-                        masked_gt = gt_image
                     if tb_writer and (idx < 5):
                         tb_writer.add_images(config['name'] + "_view_{}/render".format(viewpoint.image_name), render_image[None], global_step=iteration)
                         if iteration == testing_iterations[0]:
                             tb_writer.add_images(config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name), gt_image[None], global_step=iteration)
-                    l1_test += l1_loss(masked_render, masked_gt).mean().double()
-                    psnr_test += psnr(masked_render.unsqueeze(0), masked_gt.unsqueeze(0)).mean().double()
+                    if mask is not None:
+                        mask_sum = mask.sum().clamp(min=1.0)
+                        l1_test += (torch.abs(render_image - gt_image) * mask).sum() / mask_sum
+                        psnr_test += masked_psnr(render_image, gt_image, mask).double()
+                    else:
+                        l1_test += l1_loss(render_image, gt_image).mean().double()
+                        psnr_test += psnr(render_image.unsqueeze(0), gt_image.unsqueeze(0)).mean().double()
                 psnr_test /= len(config['cameras'])
                 l1_test /= len(config['cameras'])          
                 print("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(iteration, config['name'], l1_test, psnr_test))

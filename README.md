@@ -111,6 +111,11 @@ python train.py -s <path_to_colmap_dataset> --masks <path_to_mask_directory> --l
     -   **High Values (e.g., > 1.0)**: Enforces a strict constraint, aggressively confining the reconstruction to the mask. Can sometimes result in overly sharp or artificial-looking edges.
 
 
+### `-d` (Depth Regularization)
+-   **Usage**: `-d <path_to_depth_maps>`
+-   **Description**: Specifies the path to a directory containing monocular inverse depth maps for depth regularization. The rendered depth is converted to inverse depth before comparison with the ground truth, ensuring correct alignment with the rasterizer output. Depth scales and offsets are computed per-camera using `utils/make_depth_scale.py`.
+-   **Note**: This project uses the [slothfulxtx/diff-gaussian-rasterization](https://github.com/slothfulxtx/diff-gaussian-rasterization) rasterizer, which outputs linear depth. The training pipeline automatically converts it to inverse depth for loss computation.
+
 ### `--reorient_colmap` (Experimental)
 -   **Usage**: `--reorient_colmap`
 -   **Description**: When enabled, the system will automatically rotate the COLMAP sparse model to a canonical vehicle coordinate system (+Z up, +X forward), and back up the original data. This is useful for vehicle datasets where posture unification is required.
@@ -247,7 +252,12 @@ python train.py -s <COLMAP 数据集路径> --masks <蒙版目录路径> --lambd
     -   **中等的值 (例如 0.1 - 1.0)**: 在蒙版保真度和重建质量之间取得了良好的平衡。这个范围能有效消除大部分外部噪声，同时保持清晰的边界。建议从 `0.1` 开始。
     -   **较高的的值 (例如 > 1.0)**: 强制执行严格的约束，积极地将重建限制在蒙版内。有时可能导致边缘过于锐利或看起来不自然。
 
-### `--reorient_colmap` (实验性)
+### `-d`（深度正则化）
+-   **用法**: `-d <深度图目录路径>`
+-   **说明**: 指定包含单目逆深度图的目录路径，用于深度正则化。训练时会将渲染器输出的线性深度自动转换为逆深度，再与真值进行比较，确保与光栅化器输出正确对齐。每个相机的深度缩放和偏移参数通过 `utils/make_depth_scale.py` 计算。
+-   **注意**: 本项目使用 [slothfulxtx/diff-gaussian-rasterization](https://github.com/slothfulxtx/diff-gaussian-rasterization) 光栅化器，其输出为线性深度。训练管线会自动将其转换为逆深度进行损失计算。
+
+### `--reorient_colmap`（实验性）
 -   **用法**: `--reorient_colmap`
 -   **说明**: 启用后，系统会自动将 COLMAP 输出的稀疏模型旋转到标准车体坐标系（+Z 向上，+X 向前），并备份原始数据。适用于车辆等需要统一姿态的场景。
 -   **原理**: 结合相机分布和点云主成分分析（PCA），自动推断三轴方向。
