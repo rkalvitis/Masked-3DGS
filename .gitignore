@@ -10,3 +10,4 @@ TESTDATA
 output
 pcd_output
 batch_train.sh
+.DS_Store

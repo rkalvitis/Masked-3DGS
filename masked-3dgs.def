@@ -1,0 +1,152 @@
+Bootstrap: docker
+From: nvidia/cuda:11.8.0-cudnn8-devel-ubuntu20.04
+
+# Tip: for faster repeated builds, pre-pull the base image once
+#   singularity pull ~/containers/cuda118.sif docker://nvidia/cuda:11.8.0-cudnn8-devel-ubuntu20.04
+# then change the two lines above to:
+#   Bootstrap: localimage
+#   From: <path-to>/cuda118.sif
+
+# ---------------------------------------------------------------
+# Masked-3DGS (Jensen-JZ) — Singularity container
+#
+# Same environment as the lab's 3dgs.sif (see gaussian-splatting/3dgs.def):
+#   Python    3.8
+#   PyTorch   2.0.1  (cu118 pip wheel — includes sm_89 natively)
+#   CUDA SDK  11.8   (used to compile CUDA extensions)
+#
+# NB: the upstream environment.yml pins torch 1.12.1+cu116, which CANNOT
+# target sm_89 (RTX 4080) — the cu118 stack below is required on rhea and
+# is the same combination already proven by the lab's 3dgs.sif.
+#
+# The ONLY functional difference from 3dgs.def: the CUDA extensions are
+# compiled from Jensen-JZ/Masked-3DGS's submodules (its
+# diff-gaussian-rasterization fork adds the alpha-channel output the mask
+# loss needs). Do NOT mix this container with the plain Inria code or
+# vice versa — the rasterizer APIs differ.
+#
+# Build on rhea:
+#   singularity build --fakeroot ~/containers/masked-3dgs.sif \
+#       ~/Masked-3DGS/masked-3dgs.def
+#
+# Run example (code mounted at /workspace, GPU pinned via env because this
+# codebase has no --device flag):
+#   export SINGULARITYENV_CUDA_VISIBLE_DEVICES=0
+#   singularity exec --nv --cleanenv --contain \
+#     --bind /path/to/Masked-3DGS:/workspace \
+#     --bind /path/to/data:/data \
+#     --bind /path/to/output:/output \
+#     ~/containers/masked-3dgs.sif \
+#     python /workspace/train.py -s /data -m /output \
+#       --masks masks --lambda_mask 0.1 --eval --disable_viewer
+# ---------------------------------------------------------------
+
+%environment
+    export PATH=/opt/conda/envs/masked_gs/bin:/opt/conda/bin:$PATH
+    export CONDA_DEFAULT_ENV=masked_gs
+
+    export CUDA_HOME=/usr/local/cuda-11.8
+    export PATH=/usr/local/cuda-11.8/bin:$PATH
+    export LD_LIBRARY_PATH=/usr/local/cuda-11.8/lib64:$LD_LIBRARY_PATH
+
+    # 7.0=V100, 7.5=T4/RTX20, 8.0=A100, 8.6=RTX30, 8.9=RTX40(4080)
+    export TORCH_CUDA_ARCH_LIST="7.0;7.5;8.0;8.6;8.9"
+
+    export PYTHONDONTWRITEBYTECODE=1
+    export PYTHONUNBUFFERED=1
+    export QT_QPA_PLATFORM=offscreen
+
+%post
+    export DEBIAN_FRONTEND=noninteractive
+
+    # ---- System build dependencies ----
+    apt-get update -qq
+    apt-get install -y --no-install-recommends \
+        git wget curl ca-certificates \
+        build-essential cmake ninja-build \
+        libgl1-mesa-glx libglib2.0-0 \
+        libgomp1 \
+        libxrender1 libxext6 libsm6
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+    export CUDA_HOME=/usr/local/cuda-11.8
+    export PATH=/usr/local/cuda-11.8/bin:$PATH
+    export LD_LIBRARY_PATH=/usr/local/cuda-11.8/lib64:$LD_LIBRARY_PATH
+    export TORCH_CUDA_ARCH_LIST="7.0;7.5;8.0;8.6;8.9"
+
+    # ---- Install Miniconda ----
+    wget -q \
+        https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh \
+        -O /tmp/miniconda.sh
+    bash /tmp/miniconda.sh -b -p /opt/conda
+    rm /tmp/miniconda.sh
+
+    export PATH=/opt/conda/bin:$PATH
+
+    # ---- Accept Anaconda ToS (required by newer Miniconda releases) ----
+    /opt/conda/bin/conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main
+    /opt/conda/bin/conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r
+
+    # ---- Switch to libmamba solver (avoids classic solver hanging) ----
+    /opt/conda/bin/conda install -n base -c conda-forge conda-libmamba-solver -y
+    /opt/conda/bin/conda config --set solver libmamba
+
+    # ---- Create conda environment with Python 3.8 ----
+    /opt/conda/bin/conda create -n masked_gs python=3.8 -y
+
+    # ---- Install lightweight conda packages (fast with libmamba) ----
+    /opt/conda/bin/conda install -n masked_gs -y \
+        -c conda-forge \
+        plyfile \
+        tqdm
+
+    # ---- Install PyTorch 2.0.1 via pip (bypasses conda solver for heavy pkgs) ----
+    /opt/conda/envs/masked_gs/bin/pip install --no-cache-dir \
+        torch==2.0.1+cu118 \
+        torchvision==0.15.2+cu118 \
+        torchaudio==2.0.2+cu118 \
+        --index-url https://download.pytorch.org/whl/cu118
+
+    # ---- Remaining pip dependencies ----
+    /opt/conda/envs/masked_gs/bin/pip install --no-cache-dir \
+        opencv-python-headless \
+        joblib \
+        Pillow
+
+    # ---- Clone Masked-3DGS to compile ITS CUDA submodules ----
+    # Pinned to the commit this dataset pipeline was validated against.
+    git clone --recursive \
+        https://github.com/Jensen-JZ/Masked-3DGS \
+        /opt/masked-3dgs-src
+    cd /opt/masked-3dgs-src
+    git checkout 55e85c6
+    git submodule update --init --recursive
+
+    # ---- Build CUDA extensions (alpha-output rasterizer fork) ----
+    /opt/conda/envs/masked_gs/bin/pip install --no-cache-dir \
+        submodules/diff-gaussian-rasterization
+    /opt/conda/envs/masked_gs/bin/pip install --no-cache-dir \
+        submodules/simple-knn
+    /opt/conda/envs/masked_gs/bin/pip install --no-cache-dir \
+        submodules/fused-ssim
+
+    # ---- Cleanup ----
+    rm -rf /opt/masked-3dgs-src
+    /opt/conda/bin/conda clean -afy
+
+%labels
+    Author roberts.kalvitis
+    Version 1.0
+    Description Masked-3DGS env: Python 3.8, PyTorch 2.0.1+cu118, CUDA SDK 11.8, alpha-output rasterizer (Jensen-JZ fork @ 55e85c6)
+
+%help
+    Masked-3DGS (mask-supervised 3D Gaussian Splatting).
+      Python:   3.8
+      PyTorch:  2.0.1+cu118 (pip wheel)
+      CUDA SDK: 11.8
+      CUDA extensions compiled for sm 7.0-8.9 from Jensen-JZ/Masked-3DGS
+      (alpha-channel rasterizer — NOT interchangeable with the plain
+      Inria rasterizer in 3dgs.sif).
+    Mount the Masked-3DGS checkout to /workspace, dataset to /data,
+    output to /output. Pin the GPU with SINGULARITYENV_CUDA_VISIBLE_DEVICES
+    (this codebase has no --device flag). Always run with --nv.
