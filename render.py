@@ -75,7 +75,10 @@ if __name__ == "__main__":
     parser.add_argument("--skip_train", action="store_true")
     parser.add_argument("--skip_test", action="store_true")
     parser.add_argument("--quiet", action="store_true")
+    parser.add_argument("--device", type=int, default=0,
+                        help="CUDA device index (lab-fork style)")
     args = get_combined_args(parser)
+    torch.cuda.set_device(args.device)
     print("Rendering " + args.model_path)
 
     # Initialize system state (RNG)

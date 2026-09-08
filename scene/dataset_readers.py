@@ -18,6 +18,7 @@ from scene.colmap_loader import read_extrinsics_text, read_intrinsics_text, qvec
 from utils.graphics_utils import getWorld2View2, focal2fov, fov2focal
 import numpy as np
 import json
+import math
 from pathlib import Path
 from plyfile import PlyData, PlyElement
 from utils.sh_utils import SH2RGB
@@ -37,6 +38,8 @@ class CameraInfo(NamedTuple):
     width: int
     height: int
     is_test: bool
+    cx: Optional[float] = None   # principal point (pixels); None = image centre
+    cy: Optional[float] = None
 
 class SceneInfo(NamedTuple):
     point_cloud: BasicPointCloud
@@ -71,6 +74,7 @@ def getNerfppNorm(cam_info):
 
 def readColmapCameras(cam_extrinsics, cam_intrinsics, depths_params, images_folder, depths_folder, masks_folder, test_cam_names_list):
     cam_infos = []
+    pp_offsets = []
     for idx, key in enumerate(cam_extrinsics):
         sys.stdout.write('\r')
         # the exact output you're looking for:
@@ -90,11 +94,13 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, depths_params, images_fold
             focal_length_x = intr.params[0]
             FovY = focal2fov(focal_length_x, height)
             FovX = focal2fov(focal_length_x, width)
+            cx, cy = float(intr.params[1]), float(intr.params[2])
         elif intr.model=="PINHOLE":
             focal_length_x = intr.params[0]
             focal_length_y = intr.params[1]
             FovY = focal2fov(focal_length_y, height)
             FovX = focal2fov(focal_length_x, width)
+            cx, cy = float(intr.params[2]), float(intr.params[3])
         else:
             assert False, "Colmap camera model not handled: only undistorted datasets (PINHOLE or SIMPLE_PINHOLE cameras) supported!"
 
@@ -122,10 +128,14 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, depths_params, images_fold
         cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, depth_params=depth_params,
                               image_path=image_path, image_name=image_name, depth_path=depth_path,
                               mask_path=mask_path if mask_path else None,
-                              width=width, height=height, is_test=image_name in test_cam_names_list)
+                              width=width, height=height, is_test=image_name in test_cam_names_list,
+                              cx=cx, cy=cy)
         cam_infos.append(cam_info)
+        pp_offsets.append(math.hypot(cx - width / 2.0, cy - height / 2.0))
 
     sys.stdout.write('\n')
+    if pp_offsets and max(pp_offsets) > 1.0:
+        print(f"Principal point honoured: up to {max(pp_offsets):.1f} px from the image centre")
     return cam_infos
 
 def fetchPly(path):

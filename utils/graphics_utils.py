@@ -48,7 +48,10 @@ def getWorld2View2(R, t, translate=np.array([.0, .0, .0]), scale=1.0):
     Rt = np.linalg.inv(C2W)
     return np.float32(Rt)
 
-def getProjectionMatrix(znear, zfar, fovX, fovY):
+def getProjectionMatrix(znear, zfar, fovX, fovY, cx=None, cy=None, width=None, height=None):
+    """OpenGL-style projection. cx, cy (pixels, COLMAP convention) with the
+    image width/height shift the frustum so the principal point is honoured;
+    omitted -> symmetric frustum (principal point at the image centre)."""
     tanHalfFovY = math.tan((fovY / 2))
     tanHalfFovX = math.tan((fovX / 2))
 
@@ -68,6 +71,14 @@ def getProjectionMatrix(znear, zfar, fovX, fovY):
     P[3, 2] = z_sign
     P[2, 2] = z_sign * zfar / (zfar - znear)
     P[2, 3] = -(zfar * znear) / (zfar - znear)
+    # Principal point: x_ndc = (2 fx / W) X/Z + P[0,2]; the rasterizer maps
+    # x_ndc -> ((x_ndc + 1) W - 1) / 2, so P[0,2] = 2 cx / W - 1 lands the
+    # optical axis on pixel cx instead of W/2 (same for y).  Sign is for
+    # this z_sign = +1 (camera looks down +z) convention.
+    if cx is not None and width:
+        P[0, 2] = 2.0 * cx / width - 1.0
+    if cy is not None and height:
+        P[1, 2] = 2.0 * cy / height - 1.0
     return P
 
 def fov2focal(fov, pixels):

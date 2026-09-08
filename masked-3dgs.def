@@ -122,6 +122,17 @@ From: nvidia/cuda:11.8.0-cudnn8-devel-ubuntu20.04
     git checkout 55e85c6
     git submodule update --init --recursive
 
+    # Macro-scene fix: upstream hard-culls gaussians closer than 0.2 units
+    # to the camera (in_frustum, auxiliary.h) - at the beetle rig's 3-6 cm
+    # working distances NOTHING rasterizes and training silently learns an
+    # all-transparent model. Lower the near cull to 1 cm so metric-scale
+    # scenes work without the x20 workaround.
+    sed -i 's/p_view\.z <= 0\.2f/p_view.z <= 0.01f/' \
+        submodules/diff-gaussian-rasterization/cuda_rasterizer/auxiliary.h
+    grep -n "p_view.z <= 0.01f" \
+        submodules/diff-gaussian-rasterization/cuda_rasterizer/auxiliary.h \
+        || (echo "NEAR-CULL PATCH DID NOT APPLY" && exit 1)
+
     # ---- Build CUDA extensions (alpha-output rasterizer fork) ----
     /opt/conda/envs/masked_gs/bin/pip install --no-cache-dir \
         submodules/diff-gaussian-rasterization

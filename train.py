@@ -382,7 +382,10 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
     parser.add_argument("--reorient_colmap", action="store_true", help="Rotate COLMAP sparse model before training")
+    parser.add_argument('--device', type=int, default=0,
+                        help="CUDA device index (lab-fork style, cf. gaussian-splatting train.py)")
     args = parser.parse_args(sys.argv[1:])
+    torch.cuda.set_device(args.device)
     args.save_iterations.append(args.iterations)
 
     maybe_reorient_sparse(args)
