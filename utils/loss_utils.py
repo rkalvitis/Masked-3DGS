@@ -58,6 +58,13 @@ def create_window(window_size, channel):
     return window
 
 def ssim(img1, img2, window_size=11, size_average=True):
+    """Structural similarity between img1 and img2.
+
+    Args:
+        size_average: if True (default, used as training loss) return the scalar
+            mean SSIM over the whole batch. If False return the full per-pixel
+            SSIM map with shape [B, C, H, W].
+    """
     channel = img1.size(-3)
     window = create_window(window_size, channel)
 
@@ -87,7 +94,8 @@ def _ssim(img1, img2, window, window_size, channel, size_average=True):
     if size_average:
         return ssim_map.mean()
     else:
-        return ssim_map.mean(1).mean(1).mean(1)
+        # Full per-pixel SSIM map, shape [B, C, H, W].
+        return ssim_map
 
 
 def fast_ssim(img1, img2):

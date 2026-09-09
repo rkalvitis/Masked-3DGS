@@ -17,8 +17,9 @@ import torchvision.transforms.functional as tf
 from utils.loss_utils import ssim
 from lpipsPyTorch import lpips
 import json
+import traceback
 from tqdm import tqdm
-from utils.image_utils import psnr, masked_psnr
+from utils.image_utils import psnr, masked_psnr, masked_ssim, mask_bbox
 from argparse import ArgumentParser
 
 def readImages(renders_dir, gt_dir, masks_dir=None):
@@ -33,7 +34,8 @@ def readImages(renders_dir, gt_dir, masks_dir=None):
         gts.append(tf.to_tensor(gt).unsqueeze(0)[:, :3, :, :].cuda())
         if masks_dir is not None and (masks_dir / fname).exists():
             mask = Image.open(masks_dir / fname)
-            masks.append(tf.to_tensor(mask).unsqueeze(0)[:, :1, :, :].cuda())
+            mask = tf.to_tensor(mask).unsqueeze(0)[:, :1, :, :].cuda()
+            masks.append((mask > 0.5).float())
         else:
             masks.append(None)
         image_names.append(fname)
@@ -76,19 +78,30 @@ def evaluate(model_paths):
                 ssims = []
                 psnrs = []
                 lpipss = []
+                eval_names = []
 
                 for idx in tqdm(range(len(renders)), desc="Metric evaluation progress"):
                     if masks[idx] is not None:
                         mask = masks[idx]
+                        bbox = mask_bbox(mask)
+                        if bbox is None:
+                            print("  WARNING: empty mask for {}, skipping view".format(image_names[idx]))
+                            continue
+                        y0, y1, x0, x1 = bbox
                         masked_render = renders[idx] * mask
                         masked_gt = gts[idx] * mask
-                        ssims.append(ssim(masked_render, masked_gt))
+                        # SSIM: mean over pixels whose full window lies inside the (eroded) mask.
+                        ssims.append(masked_ssim(masked_render, masked_gt, mask))
+                        # PSNR: MSE over mask pixels only.
                         psnrs.append(masked_psnr(renders[idx].squeeze(0), gts[idx].squeeze(0), mask.squeeze(0)))
-                        lpipss.append(lpips(masked_render, masked_gt, net_type='vgg'))
+                        # LPIPS: on the padded bounding-box crop of the masked images.
+                        lpipss.append(lpips(masked_render[..., y0:y1, x0:x1],
+                                            masked_gt[..., y0:y1, x0:x1], net_type='vgg'))
                     else:
                         ssims.append(ssim(renders[idx], gts[idx]))
                         psnrs.append(psnr(renders[idx], gts[idx]))
                         lpipss.append(lpips(renders[idx], gts[idx], net_type='vgg'))
+                    eval_names.append(image_names[idx])
 
                 print("  SSIM : {:>12.7f}".format(torch.tensor(ssims).mean(), ".5"))
                 print("  PSNR : {:>12.7f}".format(torch.tensor(psnrs).mean(), ".5"))
@@ -98,16 +111,17 @@ def evaluate(model_paths):
                 full_dict[scene_dir][method].update({"SSIM": torch.tensor(ssims).mean().item(),
                                                         "PSNR": torch.tensor(psnrs).mean().item(),
                                                         "LPIPS": torch.tensor(lpipss).mean().item()})
-                per_view_dict[scene_dir][method].update({"SSIM": {name: ssim for ssim, name in zip(torch.tensor(ssims).tolist(), image_names)},
-                                                            "PSNR": {name: psnr for psnr, name in zip(torch.tensor(psnrs).tolist(), image_names)},
-                                                            "LPIPS": {name: lp for lp, name in zip(torch.tensor(lpipss).tolist(), image_names)}})
+                per_view_dict[scene_dir][method].update({"SSIM": {name: ssim for ssim, name in zip(torch.tensor(ssims).tolist(), eval_names)},
+                                                            "PSNR": {name: psnr for psnr, name in zip(torch.tensor(psnrs).tolist(), eval_names)},
+                                                            "LPIPS": {name: lp for lp, name in zip(torch.tensor(lpipss).tolist(), eval_names)}})
 
             with open(scene_dir + "/results.json", 'w') as fp:
                 json.dump(full_dict[scene_dir], fp, indent=True)
             with open(scene_dir + "/per_view.json", 'w') as fp:
                 json.dump(per_view_dict[scene_dir], fp, indent=True)
-        except:
+        except Exception:
             print("Unable to compute metrics for model", scene_dir)
+            traceback.print_exc()
 
 if __name__ == "__main__":
     # Set up command line argument parser
