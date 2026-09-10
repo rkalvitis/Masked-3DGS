@@ -88,15 +88,17 @@ def evaluate(model_paths):
                             print("  WARNING: empty mask for {}, skipping view".format(image_names[idx]))
                             continue
                         y0, y1, x0, x1 = bbox
-                        masked_render = renders[idx] * mask
-                        masked_gt = gts[idx] * mask
-                        # SSIM: mean over pixels whose full window lies inside the (eroded) mask.
-                        ssims.append(masked_ssim(masked_render, masked_gt, mask))
-                        # PSNR: MSE over mask pixels only.
-                        psnrs.append(masked_psnr(renders[idx].squeeze(0), gts[idx].squeeze(0), mask.squeeze(0)))
-                        # LPIPS: on the padded bounding-box crop of the masked images.
-                        lpipss.append(lpips(masked_render[..., y0:y1, x0:x1],
-                                            masked_gt[..., y0:y1, x0:x1], net_type='vgg'))
+                        # Identical input for every metric: the masked image (background
+                        # set to black) cropped to the padded bounding box of the mask.
+                        render_c = (renders[idx] * mask)[..., y0:y1, x0:x1]
+                        gt_c = (gts[idx] * mask)[..., y0:y1, x0:x1]
+                        mask_c = mask[..., y0:y1, x0:x1]
+                        # SSIM: mean over crop pixels whose full 11x11 window lies inside the mask.
+                        ssims.append(masked_ssim(render_c, gt_c, mask_c))
+                        # PSNR: MSE over crop pixels inside the mask.
+                        psnrs.append(masked_psnr(render_c.squeeze(0), gt_c.squeeze(0), mask_c.squeeze(0)))
+                        # LPIPS: over the whole crop (no per-pixel form exists).
+                        lpipss.append(lpips(render_c, gt_c, net_type='vgg'))
                     else:
                         ssims.append(ssim(renders[idx], gts[idx]))
                         psnrs.append(psnr(renders[idx], gts[idx]))

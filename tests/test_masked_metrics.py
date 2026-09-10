@@ -86,6 +86,17 @@ def test_cropped_lpips_higher_than_full_image_lpips():
     assert cropped > full * 3, "cropped LPIPS should be noticeably higher than full-image LPIPS"
 
 
+def test_masked_metrics_are_crop_invariant():
+    """metrics.py feeds every metric the same bbox crop; PSNR and masked SSIM
+    must give the same value on the crop as on the full image."""
+    render, gt, mask = make_pair()
+    y0, y1, x0, x1 = mask_bbox(mask)
+    r_c, g_c, m_c = render[..., y0:y1, x0:x1], gt[..., y0:y1, x0:x1], mask[..., y0:y1, x0:x1]
+    assert torch.allclose(masked_ssim(r_c, g_c, m_c), masked_ssim(render, gt, mask), atol=1e-6)
+    assert torch.allclose(masked_psnr(r_c.squeeze(0), g_c.squeeze(0), m_c.squeeze(0)),
+                          masked_psnr(render.squeeze(0), gt.squeeze(0), mask.squeeze(0)), atol=1e-4)
+
+
 def test_masked_psnr_matches_manual():
     render, gt, mask = make_pair()
     got = masked_psnr(render.squeeze(0), gt.squeeze(0), mask.squeeze(0))
