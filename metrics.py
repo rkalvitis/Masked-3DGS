@@ -23,24 +23,28 @@ from utils.image_utils import psnr, masked_psnr, masked_ssim, mask_bbox
 from argparse import ArgumentParser
 
 def readImages(renders_dir, gt_dir, masks_dir=None):
+    """Load all views as CPU tensors. They are moved to the GPU one view at a
+    time in evaluate(); loading everything onto the GPU at once OOMs at full
+    resolution (46 x 12 MP renders + GTs is ~13 GB)."""
     renders = []
     gts = []
     masks = []
     image_names = []
-    for fname in os.listdir(renders_dir):
+    for fname in sorted(os.listdir(renders_dir)):
         render = Image.open(renders_dir / fname)
         gt = Image.open(gt_dir / fname)
-        renders.append(tf.to_tensor(render).unsqueeze(0)[:, :3, :, :].cuda())
-        gts.append(tf.to_tensor(gt).unsqueeze(0)[:, :3, :, :].cuda())
+        renders.append(tf.to_tensor(render).unsqueeze(0)[:, :3, :, :])
+        gts.append(tf.to_tensor(gt).unsqueeze(0)[:, :3, :, :])
         if masks_dir is not None and (masks_dir / fname).exists():
             mask = Image.open(masks_dir / fname)
-            mask = tf.to_tensor(mask).unsqueeze(0)[:, :1, :, :].cuda()
+            mask = tf.to_tensor(mask).unsqueeze(0)[:, :1, :, :]
             masks.append((mask > 0.5).float())
         else:
             masks.append(None)
         image_names.append(fname)
     return renders, gts, masks, image_names
 
+@torch.no_grad()
 def evaluate(model_paths):
 
     full_dict = {}
@@ -90,19 +94,22 @@ def evaluate(model_paths):
                         y0, y1, x0, x1 = bbox
                         # Identical input for every metric: the masked image (background
                         # set to black) cropped to the padded bounding box of the mask.
-                        render_c = (renders[idx] * mask)[..., y0:y1, x0:x1]
-                        gt_c = (gts[idx] * mask)[..., y0:y1, x0:x1]
-                        mask_c = mask[..., y0:y1, x0:x1]
+                        # Only the crop is moved to the GPU.
+                        render_c = ((renders[idx] * mask)[..., y0:y1, x0:x1]).cuda()
+                        gt_c = ((gts[idx] * mask)[..., y0:y1, x0:x1]).cuda()
+                        mask_c = (mask[..., y0:y1, x0:x1]).cuda()
                         # SSIM: mean over crop pixels whose full 11x11 window lies inside the mask.
-                        ssims.append(masked_ssim(render_c, gt_c, mask_c))
+                        ssims.append(masked_ssim(render_c, gt_c, mask_c).cpu())
                         # PSNR: MSE over crop pixels inside the mask.
-                        psnrs.append(masked_psnr(render_c.squeeze(0), gt_c.squeeze(0), mask_c.squeeze(0)))
+                        psnrs.append(masked_psnr(render_c.squeeze(0), gt_c.squeeze(0), mask_c.squeeze(0)).cpu())
                         # LPIPS: over the whole crop (no per-pixel form exists).
-                        lpipss.append(lpips(render_c, gt_c, net_type='vgg'))
+                        lpipss.append(lpips(render_c, gt_c, net_type='vgg').cpu())
                     else:
-                        ssims.append(ssim(renders[idx], gts[idx]))
-                        psnrs.append(psnr(renders[idx], gts[idx]))
-                        lpipss.append(lpips(renders[idx], gts[idx], net_type='vgg'))
+                        render = renders[idx].cuda()
+                        gt = gts[idx].cuda()
+                        ssims.append(ssim(render, gt).cpu())
+                        psnrs.append(psnr(render, gt).cpu())
+                        lpipss.append(lpips(render, gt, net_type='vgg').cpu())
                     eval_names.append(image_names[idx])
 
                 print("  SSIM : {:>12.7f}".format(torch.tensor(ssims).mean(), ".5"))
