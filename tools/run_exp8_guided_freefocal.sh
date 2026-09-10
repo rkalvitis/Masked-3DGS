@@ -78,6 +78,7 @@ for line in open(f'{ds}/sparse_mocap_corrected/0/images.txt'):
     if len(t) != 10 or t[0].startswith('#'): continue
     poses[t[9]] = t[1:8]
 name2img = {n: (i, c) for i, n, c in imgs}
+os.makedirs(f'{work}/prior', exist_ok=True)
 open(f'{work}/prior/points3D.txt', 'w').close()
 n = 0
 with open(f'{work}/prior/cameras.txt', 'w') as fc, open(f'{work}/prior/images.txt', 'w') as fi:
@@ -125,7 +126,8 @@ if want colmap; then
     rm -rf "$WORK/tri"; mkdir -p "$WORK/tri"
     $COL colmap model_converter --input_path "$WORK/tri_ba20" --output_path "$WORK/tri" --output_type TXT
     log "$EXP model: $(grep -c '\.jpg' "$WORK/tri/images.txt") images, $(grep -vc '^#' "$WORK/tri/points3D.txt") points"
-    log "focal length after BA (fx px): $(awk '!/^#/{print $5}' "$WORK/tri/cameras.txt" | sort -n | awk '{a[NR]=$1} END{printf "min %.1f  median %.1f  max %.1f  (rig init %s)", a[1], a[int((NR+1)/2)], a[NR], ENVIRON["RIGFX"]}' RIGFX="$(awk '!/^#/{print $5; exit}' "$DATA/sparse_mocap_corrected/0/cameras.txt")")"
+    RIGFX=$(awk '!/^#/{print $5; exit}' "$DATA/sparse_mocap_corrected/0/cameras.txt")
+    log "focal length after BA (fx px): $(awk '!/^#/{print $5}' "$WORK/tri/cameras.txt" | sort -n | awk -v rig="$RIGFX" '{a[NR]=$1} END{printf "min %.1f  median %.1f  max %.1f  (rig init %s)", a[1], a[int((NR+1)/2)], a[NR], rig}')"
 
     # experiment folder: images/masks as used by exp6, sparse/0 = this model
     mkdir -p "$DATA/$EXP/sparse/0"
