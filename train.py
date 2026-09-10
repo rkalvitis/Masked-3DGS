@@ -20,7 +20,9 @@ import sys
 from scene import Scene, GaussianModel
 from utils.general_utils import safe_state, get_expon_lr_func
 import uuid
+import time
 from tqdm import tqdm
+from utils.timing_utils import TrainTimer
 from utils.image_utils import psnr, masked_psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
@@ -50,6 +52,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         sys.exit(f"Trying to use sparse adam but it is not installed, please install the correct rasterizer using pip install [3dgs_accel].")
 
     first_iter = 0
+    timer = TrainTimer(dataset, opt)
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
     scene = Scene(dataset, gaussians)
@@ -57,6 +60,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
+    timer.set_model_path(scene.model_path)
+    timer.first_iter = first_iter
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -74,6 +79,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
+    timer.mark_setup_done()
     for iteration in range(first_iter, opt.iterations + 1):
         if network_gui.conn == None:
             network_gui.try_connect()
@@ -193,9 +199,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 progress_bar.close()
 
             # Log and save
-            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp)
+            iter_ms = iter_start.elapsed_time(iter_end)
+            timer.tick(iteration, iter_ms, gaussians.get_xyz.shape[0])
+            t_eval = time.perf_counter()
+            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_ms, testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp)
+            timer.add_eval(time.perf_counter() - t_eval)
+            if iteration in testing_iterations and iteration not in saving_iterations:
+                timer.milestone(iteration, gaussians.get_xyz.shape[0], "test")
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
+                t_save = time.perf_counter()
                 scene.save(iteration)
                 if dataset.shadow:
                     iteration_dir = Path(scene.model_path) / "point_cloud" / f"iteration_{iteration}"
@@ -214,6 +227,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         )
                     except Exception as exc:
                         print(f"[shadow-gaussians] Failed to generate shadow splats: {exc}")
+                timer.add_save(time.perf_counter() - t_save)
+                timer.milestone(iteration, gaussians.get_xyz.shape[0], "save")
 
             # Densification
             if iteration < opt.densify_until_iter:
@@ -243,6 +258,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
+
+    timer.finish(gaussians.get_xyz.shape[0])
+    print("Training time written to {}".format(os.path.join(scene.model_path, "training_time.txt")))
 
 
 def _discover_colmap_sets(root: Path):
