@@ -19,10 +19,12 @@
 #   git push the tools (Masked-3DGS main) and rsync gs_upload/{intrinsics_factory.csv,
 #   sparse_mocap_factoryK,sparse_mocap_sfmrefit} to $ROOT/data/   (see chat)
 #
-# Launch on rhea (git pull first, then this script, then log out):
-#   cd /home/robertsk/3dgs-masked && git pull origin main && \
-#   ROOT=/media/white/nanodrones/roberts.kalvitis/3dgs/popillia/362img_01_09_masked && mkdir -p $ROOT/logs && \
-#   nohup bash tools/run_all_exp10_11_on_rhea.sh > $ROOT/logs/run_all_$(date +%m%d_%H%M).log 2>&1 < /dev/null &
+# Launch on rhea inside screen (everything is shown live AND logged):
+#   screen -S exp10_11
+#   cd /home/robertsk/3dgs-masked && git pull origin main && DBRUN=factoryK_0911_1241 \
+#     bash /home/robertsk/3dgs-masked/tools/run_all_exp10_11_on_rhea.sh 2>&1 | tee \
+#     /media/white/nanodrones/roberts.kalvitis/3dgs/popillia/362img_01_09_masked/logs/run_all_$(date +%m%d_%H%M).log
+#   (detach: Ctrl-A D, re-attach: screen -r exp10_11)
 # =============================================================================
 set -u
 ROOT=${ROOT:-/media/white/nanodrones/roberts.kalvitis/3dgs/popillia/362img_01_09_masked}
@@ -51,7 +53,9 @@ run_stage() {   # run_stage <label> <stage> [ENV=... ...]
     local logf=$LOGS/${label}_$TAG.log
     log "=== $label: stage $stage ($*) -> $logf ==="
     local t=$(date +%s)
-    if env "$@" bash "$SCRIPT" "$stage" > "$logf" 2>&1; then
+    # full stage output goes to its log file AND to stdout (visible live in screen/tmux)
+    env "$@" bash "$SCRIPT" "$stage" 2>&1 | tee "$logf"
+    if [ "${PIPESTATUS[0]}" -eq 0 ]; then
         note "$label: OK  ($(( ($(date +%s) - t) / 60 )) min)  log $logf"
     else
         note "$label: FAILED ($(( ($(date +%s) - t) / 60 )) min) — see $logf (last lines below)"
