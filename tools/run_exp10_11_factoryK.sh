@@ -1,7 +1,8 @@
 #!/bin/bash
 # =============================================================================
 # ring362 — exp10 (mocap + hand-eye as HARD guidance) and exp11 (mocap as SOFT
-# prior), both with the FACTORY intrinsics fixed, 30k-iteration 3DGS.
+# prior), both with the FACTORY intrinsics fixed, then 3DGS (ITERS, default 100k,
+# same recipe as exp4/exp6/exp8; ITERS=30000 reproduces run 0911_1241).
 #
 #   db     one feature database with ONE PINHOLE camera PER IMAGE whose params are
 #          the iPhone factory intrinsics of that photo (data/intrinsics_factory.csv:
@@ -46,7 +47,7 @@ GPU=${GPU:-0}; RES=${RES:-1}
 RUN=${RUN:-factoryK}
 PRIOR=${PRIOR:-sparse_mocap_factoryK}
 PRIOR_STD=${PRIOR_STD:-0.015}
-ITERS=${ITERS:-30000}
+ITERS=${ITERS:-100000}
 TRAIN_SCALE=${TRAIN_SCALE:-100}
 CODE=${CODE:-/home/robertsk/3dgs-masked}
 TORCH_CACHE=${TORCH_CACHE:-/media/white/nanodrones/roberts.kalvitis/3dgs/torch_cache}
@@ -78,6 +79,19 @@ log "RUN=$RUN prior=$PRIOR std=$PRIOR_STD iters=$ITERS train_scale=$TRAIN_SCALE 
 [ "$PATCH" = no ] && [ "$TRAIN_SCALE" = 1 ] && { log "ABORT: no near-cull patch in the container and TRAIN_SCALE=1 -> nothing would render"; exit 1; }
 
 # ── helpers (python in 3dgs.sif) ─────────────────────────────────────────────
+# is the feature database complete? (exit code of a COLMAP step can be nonzero
+# when the process is signalled while exiting, e.g. SIGTERM at OpenMP teardown)
+db_complete() {   # db_complete <db> <min verified pairs>
+    $PY python - "$1" "$2" <<'PYEOF'
+import sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+n = c.execute('SELECT COUNT(*) FROM images').fetchone()[0]
+kp = c.execute('SELECT COUNT(*) FROM keypoints WHERE rows > 0').fetchone()[0]
+pairs = c.execute('SELECT COUNT(*) FROM two_view_geometries WHERE rows > 0').fetchone()[0]
+print(f'database: {n} images, {kp} with keypoints, {pairs} verified pairs')
+sys.exit(0 if n >= 362 and kp >= 362 and pairs >= int(sys.argv[2]) else 1)
+PYEOF
+}
 # prior model with database-consistent image/camera ids, per-image factory K
 make_prior() {   # make_prior <db> <prior model dir> <out dir> <intrinsics csv>
     $PY python - "$1" "$2" "$3" "$4" <<'PYEOF'
@@ -187,18 +201,38 @@ PYEOF
         ln -s "$rel" "$2/$d"
     done
 }
-train_eval() {   # train_eval <exp folder name> <model output name>
-    local exp=$1 name=$2
-    fresh "$OUT/$name"; mkdir -p "$OUT/$name"
-    log "=== TRAIN $name ($ITERS iterations, res $RES) ==="
+# training recipe = exp4/exp6/exp8 full-res 100k (run_full_res.sh): densify until 25k,
+# point clouds at 30k/60k/90k/final, plus a checkpoint at the end (chkpnt<ITERS>.pth) so
+# a run can be CONTINUED later with --start_checkpoint instead of retrained.
+DENSIFY_UNTIL=${DENSIFY_UNTIL:-$([ "$ITERS" -ge 50000 ] && echo 25000 || echo $((ITERS / 2)))}
+iters_upto() { for i in "$@"; do [ "$i" -lt "$ITERS" ] && printf '%s ' "$i"; done; printf '%s' "$ITERS"; }
+SAVE_ITERS=$(iters_upto 30000 60000 90000); TEST_ITERS=$(iters_upto 7000 30000 60000 90000)
+train_once() {   # train_once <exp folder name> <model output name> [extra train args]
+    local exp=$1 name=$2; shift 2
+    mkdir -p "$OUT/$name"
     $GS env PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128 \
         python /workspace/train.py -s "/data/$exp" -m "/outroot/$name" \
         --masks masks --lambda_mask 0.1 --eval --disable_viewer \
         --data_device cpu --device "$GPU" -r "$RES" --random_background \
-        --iterations "$ITERS" --densify_until_iter $((ITERS / 2)) \
-        --save_iterations "$ITERS" --test_iterations 7000 "$ITERS" \
+        --iterations "$ITERS" --densify_until_iter "$DENSIFY_UNTIL" \
+        --save_iterations $SAVE_ITERS --test_iterations $TEST_ITERS \
+        --checkpoint_iterations "$ITERS" "$@" \
         2>&1 | tee "$OUT/$name/train.log"
-    [ -d "$OUT/$name/point_cloud/iteration_$ITERS" ] || { log "$name: training FAILED (see train.log)"; return 1; }
+    [ -d "$OUT/$name/point_cloud/iteration_$ITERS" ]
+}
+train_eval() {   # train_eval <exp folder name> <model output name>
+    local exp=$1 name=$2
+    fresh "$OUT/$name"
+    log "=== TRAIN $name ($ITERS iterations, densify until $DENSIFY_UNTIL, res $RES) attempt 1 ==="
+    if ! train_once "$exp" "$name"; then
+        # full-res 100k can run out of GPU memory during densification (seen in exp6_r1):
+        # keep the failed attempt for the record, retry with a higher densify threshold
+        mv "$OUT/$name" "$OUT/${name}_attempt1_failed"
+        log "$name: attempt 1 FAILED (OOM?) — kept as ${name}_attempt1_failed; attempt 2 with --densify_grad_threshold 0.0004"
+        train_once "$exp" "$name" --densify_grad_threshold 0.0004 \
+            || { log "$name: attempt 2 FAILED — giving up (see $OUT/$name/train.log)"; return 1; }
+        log "$name: attempt 2 succeeded (NOTE: densify_grad_threshold 0.0004)"
+    fi
     grep -m1 "Principal point honoured" "$OUT/$name/train.log" || log "WARNING: principal-point fix not active for $name"
     log "=== RENDER + METRICS $name ==="
     $GS python /workspace/render.py -m "/outroot/$name" --device "$GPU" --skip_train || log "render $name failed"
@@ -242,8 +276,9 @@ print(','.join(f'{np.median([float(x[k]) for x in r]):.4f}' for k in ('fx','fy',
         --ImageReader.camera_model PINHOLE --ImageReader.single_camera 0 \
         --ImageReader.camera_params "$KMED" \
         ${EX_MAXSZ:+$EX_MAXSZ 3200} ${EX_PEAK:+$EX_PEAK 0.004} ${EX_NFEAT:+$EX_NFEAT 16384} \
-        ${EX_GPU:+$EX_GPU 1} ${EX_IDX:+$EX_IDX "$GPU"} \
-        || { log "feature extraction FAILED"; exit 1; }
+        ${EX_GPU:+$EX_GPU 1} ${EX_IDX:+$EX_IDX "$GPU"}
+    rc=$?; [ $rc -ne 0 ] && log "feature_extractor exit code $rc — checking the database content instead"
+    db_complete "$DB" 0 || { log "feature extraction FAILED"; exit 1; }
     log "=== db: per-image factory intrinsics into the cameras table ==="
     $PY python - "$DB" "$INTR" <<'PYEOF'
 import csv, sqlite3, sys
@@ -268,14 +303,10 @@ PYEOF
     [ $? -eq 0 ] || { log "ABORT: setting intrinsics failed"; exit 1; }
     log "=== db: exhaustive guided matching ==="
     $COL colmap exhaustive_matcher --database_path "$DB" \
-        ${M_GUIDED:+$M_GUIDED 1} ${M_RATIO:+$M_RATIO 0.85} ${M_GPU:+$M_GPU 1} ${M_IDX:+$M_IDX "$GPU"} \
-        || { log "matching FAILED"; exit 1; }
-    $PY python - "$DB" <<'PYEOF'
-import sqlite3, sys
-c = sqlite3.connect(sys.argv[1])
-print(f'database: {c.execute("SELECT SUM(rows) FROM keypoints").fetchone()[0]} keypoints, '
-      f'{c.execute("SELECT COUNT(*) FROM two_view_geometries WHERE rows > 0").fetchone()[0]} verified pairs')
-PYEOF
+        ${M_GUIDED:+$M_GUIDED 1} ${M_RATIO:+$M_RATIO 0.85} ${M_GPU:+$M_GPU 1} ${M_IDX:+$M_IDX "$GPU"}
+    rc=$?; [ $rc -ne 0 ] && log "exhaustive_matcher exit code $rc — checking the database content instead"
+    db_complete "$DB" 3000 || { log "matching FAILED (database incomplete)"; exit 1; }
+    touch "$DBWORK/COMPLETE"
 fi
 
 # ── 2. exp10: hard guidance (prior -> triangulate -> BA, K fixed) ────────────
@@ -291,9 +322,9 @@ if want exp10; then
     BA_FL=$(findopt bundle_adjuster refine_focal_length); BA_PP=$(findopt bundle_adjuster refine_principal_point)
     BA_EP=$(findopt bundle_adjuster refine_extra_params)
     IN=$W10/prior
-    # the prior is ~460 px off (factoryK) / ~260 px (sfmrefit) vs the free SfM, so the
-    # first round must accept more than that or nothing survives triangulation
-    for round in 500 200 100 50 20; do
+    # rounds as in exp6 (200 -> 20). A 500 px first round (run 0911_1241) made the
+    # retriangulation + global BA run for hours and segfault: too permissive merging.
+    for round in 200 100 50 20; do
         log "=== exp10: triangulate (max reproj $round px) + bundle adjust (K FIXED) ==="
         mkdir -p "$W10/tri_r$round" "$W10/tri_ba$round"
         $COL colmap point_triangulator --database_path "$DB" --image_path "$DATA/images" \
