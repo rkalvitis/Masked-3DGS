@@ -16,6 +16,9 @@
 #   exp11  pose_prior_mapper: incremental SfM from the matches, mocap centres as
 #          Gaussian position priors (std PRIOR_STD, robust loss), intrinsics FIXED
 #          -> metric insect-frame model without post-hoc alignment -> 3DGS.
+#   exp12  control = exp4 route (free incremental mapper, no mocap inside COLMAP)
+#          but intrinsics FIXED at factory; sim3-aligned onto the mocap centres
+#          afterwards so it trains under the same metric conditions -> 3DGS.
 #
 # REPRODUCIBILITY CONTRACT: nothing existing is deleted or overwritten. Every
 # output is under a RUN tag; a stage aborts if its output folder already exists.
@@ -31,7 +34,7 @@
 #   data/colmap_work/colmap_masks            dilated feature masks of the free run (else remade)
 #   data/colmap_work2/sfm/<largest>          free perimage model (audit only, optional)
 #
-#   bash tools/run_exp10_11_factoryK.sh [db|exp10|exp11|all]        (default all)
+#   bash tools/run_exp10_11_factoryK.sh [db|exp10|exp11|exp12|all]  (default all)
 #   RUN=factoryK  DBRUN=<db tag, default RUN>  PRIOR=sparse_mocap_factoryK  PRIOR_STD=0.015  ITERS=30000
 #   TRAIN_SCALE=100  RES=1  GPU=0
 #
@@ -57,6 +60,9 @@ SIF_COL=${SIF_COL:-$HOME/containers/colmap-cuda.sif}
 INTR=$DATA/intrinsics_factory.csv
 PRIOR_MODEL=$DATA/$PRIOR/0
 DBRUN=${DBRUN:-$RUN}                      # feature database tag (reuse one db for several RUNs)
+RESUME=${RESUME:-0}                       # 1 = continue an earlier run with this RUN tag: reuse its COLMAP
+                                          # model; continue 3DGS from its checkpoint in the same folder, or
+                                          # (no checkpoint) train the full schedule into <name>_it<ITERS>
 DBWORK=$DATA/colmap_work_factoryK_$DBRUN
 DB=$DBWORK/database.db
 unset SINGULARITYENV_CUDA_VISIBLE_DEVICES
@@ -222,6 +228,35 @@ train_once() {   # train_once <exp folder name> <model output name> [extra train
 }
 train_eval() {   # train_eval <exp folder name> <model output name>
     local exp=$1 name=$2
+    if [ -e "$OUT/$name" ] && [ "$RESUME" = 1 ]; then
+        # RESUME: continue an earlier (shorter) run of the same RUN tag
+        local ck=$(ls "$OUT/$name"/chkpnt*.pth 2>/dev/null | sed 's/.*chkpnt\([0-9]*\)\.pth/\1/' | sort -n | tail -1)
+        if [ -d "$OUT/$name/point_cloud/iteration_$ITERS" ]; then
+            log "$name: already trained to $ITERS — training skipped, re-running render + metrics"
+        elif [ -n "$ck" ] && [ "$ck" -lt "$ITERS" ]; then
+            log "=== RESUME $name from checkpoint $ck -> $ITERS iterations (same folder) ==="
+            train_once "$exp" "$name" --start_checkpoint "/outroot/$name/chkpnt$ck.pth" \
+                || { log "$name: resume FAILED (see $OUT/$name/train.log)"; return 1; }
+        else
+            # a run without checkpoint (e.g. the 30k runs of 0915_1008) cannot be continued by
+            # train.py; keep it untouched and train the full schedule into a sibling folder
+            local new=${name}_it$ITERS
+            log "$name exists without a checkpoint — cannot be continued; training fresh into $new"
+            name=$new
+            train_eval_fresh "$exp" "$name" || return 1
+        fi
+    else
+        train_eval_fresh "$exp" "$name" || return 1
+    fi
+    grep -m1 "Principal point honoured" "$OUT/$name/train.log" || log "WARNING: principal-point fix not active for $name"
+    log "=== RENDER + METRICS $name ==="
+    $GS python /workspace/render.py -m "/outroot/$name" --device "$GPU" --skip_train || log "render $name failed"
+    $GS env TORCH_HOME=/torch_cache PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128 \
+        python /workspace/metrics.py -m "/outroot/$name" --device "$GPU" 2>&1 | tee "$OUT/$name/metrics.log"
+    [ -f "$OUT/$name/results.json" ] && { echo "--- $name"; cat "$OUT/$name/results.json"; echo; }
+}
+train_eval_fresh() {   # train_eval_fresh <exp folder name> <model output name>: full schedule, OOM retry
+    local exp=$1 name=$2
     fresh "$OUT/$name"
     log "=== TRAIN $name ($ITERS iterations, densify until $DENSIFY_UNTIL, res $RES) attempt 1 ==="
     if ! train_once "$exp" "$name"; then
@@ -233,12 +268,6 @@ train_eval() {   # train_eval <exp folder name> <model output name>
             || { log "$name: attempt 2 FAILED — giving up (see $OUT/$name/train.log)"; return 1; }
         log "$name: attempt 2 succeeded (NOTE: densify_grad_threshold 0.0004)"
     fi
-    grep -m1 "Principal point honoured" "$OUT/$name/train.log" || log "WARNING: principal-point fix not active for $name"
-    log "=== RENDER + METRICS $name ==="
-    $GS python /workspace/render.py -m "/outroot/$name" --device "$GPU" --skip_train || log "render $name failed"
-    $GS env TORCH_HOME=/torch_cache PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128 \
-        python /workspace/metrics.py -m "/outroot/$name" --device "$GPU" 2>&1 | tee "$OUT/$name/metrics.log"
-    [ -f "$OUT/$name/results.json" ] && { echo "--- $name"; cat "$OUT/$name/results.json"; echo; }
 }
 
 # ── 1. db: per-image factory-K feature database ──────────────────────────────
@@ -311,8 +340,11 @@ fi
 
 # ── 2. exp10: hard guidance (prior -> triangulate -> BA, K fixed) ────────────
 if want exp10; then
-    [ -f "$DB" ] || { log "ABORT: $DB missing (run the db stage with RUN=$RUN)"; exit 1; }
     W10=$DATA/colmap_work_exp10_$RUN; EXP10=exp10_guided_$RUN; NAME10=$EXP10; [ "$RES" = 1 ] && NAME10=${EXP10}_r1
+  if [ "$RESUME" = 1 ] && [ -f "$W10/tri/images.txt" ] && [ -f "$DATA/$EXP10/sparse/0/images.txt" ]; then
+    log "=== exp10: RESUME — COLMAP model $W10/tri and $DATA/$EXP10 exist, reused as they are ==="
+  else
+    [ -f "$DB" ] || { log "ABORT: $DB missing (run the db stage with RUN=$RUN)"; exit 1; }
     fresh "$W10"; mkdir -p "$W10"
     printf 'run=%s\nprior=%s\nintrinsics=%s\ndb=%s\niters=%s\ntrain_scale=%s\ndate=%s\n' "$RUN" "$PRIOR_MODEL" "$INTR" "$DB" "$ITERS" "$TRAIN_SCALE" "$(date '+%F %T')" > "$W10/run_params.txt"
     log "=== exp10: prior from $PRIOR_MODEL ==="
@@ -342,14 +374,18 @@ if want exp10; then
     log "exp10 model: $(grep -c '\.jpg' "$W10/tri/images.txt") images, $(grep -vc '^#' "$W10/tri/points3D.txt") points"
     audit "$W10/tri" "$W10/prior"
     make_train_folder "$W10/tri" "$DATA/$EXP10"; cp "$W10/run_params.txt" "$DATA/$EXP10/"
+  fi
     train_eval "$EXP10" "$NAME10" || true
 fi
 
 # ── 3. exp11: soft prior (pose_prior_mapper, K fixed) ────────────────────────
 if want exp11; then
+    W11=$DATA/colmap_work_exp11_$RUN; EXP11=exp11_pose_prior_$RUN; NAME11=$EXP11; [ "$RES" = 1 ] && NAME11=${EXP11}_r1
+  if [ "$RESUME" = 1 ] && [ -f "$W11/tri/images.txt" ] && [ -f "$DATA/$EXP11/sparse/0/images.txt" ]; then
+    log "=== exp11: RESUME — COLMAP model $W11/tri and $DATA/$EXP11 exist, reused as they are ==="
+  else
     [ -f "$DB" ] || { log "ABORT: $DB missing (run the db stage with RUN=$RUN)"; exit 1; }
     $COL colmap pose_prior_mapper -h >/dev/null 2>&1 || { log "ABORT: this COLMAP has no pose_prior_mapper (needs >= 3.11)"; exit 1; }
-    W11=$DATA/colmap_work_exp11_$RUN; EXP11=exp11_pose_prior_$RUN; NAME11=$EXP11; [ "$RES" = 1 ] && NAME11=${EXP11}_r1
     fresh "$W11"; mkdir -p "$W11"
     printf 'run=%s\nprior=%s\nprior_std_m=%s\nintrinsics=%s\ndb=%s\niters=%s\ntrain_scale=%s\ndate=%s\n' "$RUN" "$PRIOR_MODEL" "$PRIOR_STD" "$INTR" "$DB" "$ITERS" "$TRAIN_SCALE" "$(date '+%F %T')" > "$W11/run_params.txt"
     cp "$DB" "$W11/database.db"
@@ -409,11 +445,101 @@ PYEOF
     log "exp11 model: $BEST_N images (expect 362), $(grep -vc '^#' "$W11/tri/points3D.txt") points"
     audit "$W11/tri" "$W11/prior"
     make_train_folder "$W11/tri" "$DATA/$EXP11"; cp "$W11/run_params.txt" "$DATA/$EXP11/"
+  fi
     train_eval "$EXP11" "$NAME11" || true
 fi
 
+# ── 4. exp12: exp4 route (free incremental mapper, NO mocap) with factory K fixed ─
+# control for exp11: same database, same fixed intrinsics, no position priors. The
+# mapper's frame is arbitrary, so the model is sim3-aligned onto the mocap prior
+# centres afterwards (as exp4 needed) -> metric insect frame, trained like exp10/11.
+if want exp12; then
+    W12=$DATA/colmap_work_exp12_$RUN; EXP12=exp12_free_$RUN; NAME12=$EXP12; [ "$RES" = 1 ] && NAME12=${EXP12}_r1
+  if [ "$RESUME" = 1 ] && [ -f "$W12/tri/images.txt" ] && [ -f "$DATA/$EXP12/sparse/0/images.txt" ]; then
+    log "=== exp12: RESUME — COLMAP model $W12/tri and $DATA/$EXP12 exist, reused as they are ==="
+  else
+    [ -f "$DB" ] || { log "ABORT: $DB missing (run the db stage with RUN=$RUN)"; exit 1; }
+    fresh "$W12"; mkdir -p "$W12/sfm"
+    printf 'run=%s\nroute=free incremental mapper, factory K fixed, sim3 onto %s\nintrinsics=%s\ndb=%s\niters=%s\ntrain_scale=%s\ndate=%s\n' "$RUN" "$PRIOR_MODEL" "$INTR" "$DB" "$ITERS" "$TRAIN_SCALE" "$(date '+%F %T')" > "$W12/run_params.txt"
+    make_prior "$DB" "$PRIOR_MODEL" "$W12/prior" "$INTR" || { log "ABORT: prior (alignment target) failed"; exit 1; }
+    MP_FL=$(findopt mapper ba_refine_focal_length); MP_PP=$(findopt mapper ba_refine_principal_point); MP_EP=$(findopt mapper ba_refine_extra_params)
+    log "=== exp12: mapper (free SfM as exp4, K FIXED at factory, no priors) ==="
+    $COL colmap mapper --database_path "$DB" --image_path "$DATA/images" --output_path "$W12/sfm" \
+        ${MP_FL:+$MP_FL 0} ${MP_PP:+$MP_PP 0} ${MP_EP:+$MP_EP 0} \
+        || { log "exp12 mapper FAILED"; exit 1; }
+    BEST=""; BEST_N=0
+    for d in "$W12"/sfm/*/; do
+        [ -f "$d/images.bin" ] || [ -f "$d/images.txt" ] || continue
+        c="$W12/cand_$(basename "$d")"; mkdir -p "$c"
+        $COL colmap model_converter --input_path "$d" --output_path "$c" --output_type TXT >/dev/null 2>&1
+        n=$(grep -c '\.jpg' "$c/images.txt" 2>/dev/null || echo 0); log "model $d: $n images"
+        [ "$n" -gt "$BEST_N" ] && { BEST=$c; BEST_N=$n; }
+    done
+    [ -n "$BEST" ] || { log "ABORT: exp12 mapper produced no model"; exit 1; }
+    log "exp12 free model: $BEST_N images (expect 362), $(grep -vc '^#' "$BEST/points3D.txt") points — aligning onto the mocap prior centres"
+    mkdir -p "$W12/tri"; cp "$BEST/cameras.txt" "$W12/tri/"
+    $PY python - "$BEST" "$W12/prior" "$W12/tri" <<'PYEOF'
+import sys
+import numpy as np
+src, prior_dir, out = sys.argv[1:4]
+def q2R(w, x, y, z):
+    n = (w*w + x*x + y*y + z*z) ** 0.5; w, x, y, z = w/n, x/n, y/n, z/n
+    return np.array([[1-2*(y*y+z*z), 2*(x*y-z*w), 2*(x*z+y*w)],
+                     [2*(x*y+z*w), 1-2*(x*x+z*z), 2*(y*z-x*w)],
+                     [2*(x*z-y*w), 2*(y*z+x*w), 1-2*(x*x+y*y)]])
+def R2q(R):
+    w = np.sqrt(max(0.0, 1 + R[0,0] + R[1,1] + R[2,2])) / 2
+    if w > 1e-8:
+        return np.array([w, (R[2,1]-R[1,2])/(4*w), (R[0,2]-R[2,0])/(4*w), (R[1,0]-R[0,1])/(4*w)])
+    i = int(np.argmax([R[0,0], R[1,1], R[2,2]])); j, k = (i+1)%3, (i+2)%3
+    s = np.sqrt(max(0.0, 1 + R[i,i] - R[j,j] - R[k,k])) * 2; v = [0.0]*3
+    v[i] = s/4; v[j] = (R[j,i]+R[i,j])/s; v[k] = (R[k,i]+R[i,k])/s
+    return np.array([(R[k,j]-R[j,k])/s] + v)
+def is_pose(t): return len(t) >= 10 and not t[0].startswith('#') and t[9].lower().endswith(('.jpg', '.png', '.jpeg'))
+def read(path):
+    out = {}
+    for line in open(path):
+        t = line.split()
+        if is_pose(t):
+            R = q2R(*map(float, t[1:5])); tv = np.array(list(map(float, t[5:8]))); out[t[9]] = -R.T @ tv
+    return out
+sfm, prior = read(f'{src}/images.txt'), read(f'{prior_dir}/images.txt')
+common = sorted(set(sfm) & set(prior)); assert len(common) >= 10, f'only {len(common)} common cameras'
+A = np.array([sfm[n] for n in common]); B = np.array([prior[n] for n in common])
+ma, mb = A.mean(0), B.mean(0); xa, xb = A - ma, B - mb
+U, D, Vt = np.linalg.svd(xb.T @ xa / len(A)); S = np.eye(3)
+if np.linalg.det(U) * np.linalg.det(Vt) < 0: S[2, 2] = -1
+R = U @ S @ Vt; s = np.trace(np.diag(D) @ S) * len(A) / (xa ** 2).sum(); t = mb - s * R @ ma
+d = np.linalg.norm(s * (R @ A.T).T + t - B, axis=1) * 1000
+print(f'sim3 onto the mocap prior centres: {len(common)} cams, scale {s:.5f}; residual p50 {np.percentile(d,50):.2f} p90 {np.percentile(d,90):.2f} max {d.max():.2f} mm (= mocap prior error, ~10 mm expected)')
+with open(f'{src}/images.txt') as fi, open(f'{out}/images.txt', 'w') as fo:
+    for line in fi:
+        tk = line.split()
+        if is_pose(tk):
+            Rcw = q2R(*map(float, tk[1:5])); tv = np.array(list(map(float, tk[5:8])))
+            Cn = s * R @ (-Rcw.T @ tv) + t; Rn = Rcw @ R.T; tn = -Rn @ Cn; q = R2q(Rn)
+            fo.write(f'{tk[0]} {q[0]:.9f} {q[1]:.9f} {q[2]:.9f} {q[3]:.9f} {tn[0]:.9f} {tn[1]:.9f} {tn[2]:.9f} {tk[8]} {tk[9]}\n')
+        else:
+            fo.write(line)          # observation lines and comments verbatim
+n = 0
+with open(f'{src}/points3D.txt') as fi, open(f'{out}/points3D.txt', 'w') as fo:
+    for line in fi:
+        if line.startswith('#') or not line.strip():
+            fo.write(line); continue
+        tk = line.split(); p = s * R @ np.array(list(map(float, tk[1:4]))) + t
+        fo.write(' '.join([tk[0], f'{p[0]:.9f}', f'{p[1]:.9f}', f'{p[2]:.9f}'] + tk[4:]) + '\n'); n += 1
+print(f'{n} points transformed -> {out}')
+PYEOF
+    [ $? -eq 0 ] || { log "ABORT: exp12 alignment failed"; exit 1; }
+    audit "$W12/tri" "$W12/prior"
+    make_train_folder "$W12/tri" "$DATA/$EXP12"; cp "$W12/run_params.txt" "$DATA/$EXP12/"
+  fi
+    train_eval "$EXP12" "$NAME12" || true
+fi
+
 log "=== SUMMARY (results.json) ==="
-for n in exp4_colmap_perimage exp6_colmap_guided_r1 exp8_colmap_guided_freefocal_r1 exp10_guided_${RUN}_r1 exp10_guided_$RUN exp11_pose_prior_${RUN}_r1 exp11_pose_prior_$RUN; do
-    [ -f "$OUT/$n/results.json" ] && { echo "--- $n"; cat "$OUT/$n/results.json"; echo; }
+for f in "$OUT"/exp4_colmap_perimage/results.json "$OUT"/exp6_colmap_guided_r1/results.json "$OUT"/exp8_colmap_guided_freefocal_r1/results.json \
+         "$OUT"/exp10_guided_${RUN}*/results.json "$OUT"/exp11_pose_prior_${RUN}*/results.json "$OUT"/exp12_free_${RUN}*/results.json; do
+    [ -f "$f" ] && { echo "--- $(basename "$(dirname "$f")")"; cat "$f"; echo; }
 done
 log "all done."

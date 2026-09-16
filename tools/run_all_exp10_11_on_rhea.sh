@@ -4,8 +4,10 @@
 #
 #   db                 factory-K per-image feature database (~5 min; skipped with
 #                      DBRUN=<tag> of an existing complete one, e.g. factoryK_0911_1241)
-#   exp10 (factoryK)   mocap + factory-K hand-eye as HARD prior     (~2 min COLMAP + 3DGS)
 #   exp11 (factoryK)   mocap centres as SOFT prior, pose_prior_mapper (~15 min + 3DGS)
+#   exp12 (free)       control: exp4 route (free mapper, no mocap) with factory K fixed,
+#                      sim3-aligned onto the mocap centres afterwards (~15 min + 3DGS)
+#   exp10 (factoryK)   mocap + factory-K hand-eye as HARD prior     (~2 min COLMAP + 3DGS)
 #   exp10 (sfmrefit)   same hard route with the SfM-refitted hand-eye prior
 #   exp11 (sfmrefit)   soft prior with the SfM-refitted hand-eye prior (EXTRA=0 skips it)
 #
@@ -19,6 +21,10 @@
 #   git push the tools (Masked-3DGS main) and rsync gs_upload/{intrinsics_factory.csv,
 #   sparse_mocap_factoryK,sparse_mocap_sfmrefit} to $ROOT/data/   (see chat)
 #
+# To take an earlier launch to more iterations (COLMAP reused; 3DGS continued from its
+# checkpoint in the same folder, or retrained into <name>_it<ITERS> when there is none):
+#   RESUME=0915_1008 bash tools/run_all_exp10_11_on_rhea.sh 2>&1 | tee .../logs/run_all_$(date +%m%d_%H%M).log
+#
 # Launch on rhea inside screen (everything is shown live AND logged):
 #   screen -S exp10_11
 #   cd /home/robertsk/3dgs-masked && git pull origin main && DBRUN=factoryK_0911_1241 \
@@ -31,8 +37,13 @@ ROOT=${ROOT:-/media/white/nanodrones/roberts.kalvitis/3dgs/popillia/362img_01_09
 CODE=${CODE:-/home/robertsk/3dgs-masked}
 export GPU=${GPU:-0} RES=${RES:-1} ITERS=${ITERS:-100000} TRAIN_SCALE=${TRAIN_SCALE:-100} PRIOR_STD=${PRIOR_STD:-0.015}
 export ROOT CODE
-TAG=${TAG:-$(date +%m%d_%H%M)}
+# RESUME=<tag of an earlier launch>: same RUN tags, so COLMAP models are reused and 3DGS
+# continues in the same output folders (from a checkpoint) or into <name>_it<ITERS>
+RESUME_TAG=${RESUME:-}
+if [ -n "$RESUME_TAG" ]; then TAG=$RESUME_TAG; export RESUME=1; else TAG=${TAG:-$(date +%m%d_%H%M)}; export RESUME=0; fi
 EXTRA=${EXTRA:-1}      # 1 = also exp11 with the SfM-refit prior (all four experiments)
+ONLY=${ONLY:-}         # space-separated stage labels to run, e.g. ONLY="exp10_sfmrefit exp12_free"
+                       # (labels: exp11_factoryK exp12_free exp10_factoryK exp10_sfmrefit exp11_sfmrefit)
 SCRIPT=$CODE/tools/run_exp10_11_factoryK.sh
 LOGS=$ROOT/logs; mkdir -p "$LOGS"
 SUMMARY=$LOGS/summary_exp10_11_$TAG.txt
@@ -40,7 +51,7 @@ T0=$(date +%s)
 log() { echo "[$(date '+%F %T')] $*"; }
 note() { echo "$*" | tee -a "$SUMMARY"; }
 
-note "=== exp10/exp11 one-shot run, tag $TAG, started $(date '+%F %T') on $(hostname) ==="
+note "=== exp10/exp11 one-shot run, tag $TAG$([ "$RESUME" = 1 ] && echo ' (RESUME of that launch)'), started $(date '+%F %T') on $(hostname) ==="
 note "GPU $GPU, res $RES, iters $ITERS, train_scale $TRAIN_SCALE, prior std $PRIOR_STD m"
 [ -f "$SCRIPT" ] || { note "ABORT: $SCRIPT missing (git pull the tools first)"; exit 1; }
 for f in "$ROOT/data/intrinsics_factory.csv" "$ROOT/data/sparse_mocap_factoryK/0/images.txt" "$ROOT/data/sparse_mocap_sfmrefit/0/images.txt"; do
@@ -50,6 +61,7 @@ nvidia-smi -i "$GPU" --query-gpu=name,memory.used,memory.total --format=csv,nohe
 
 run_stage() {   # run_stage <label> <stage> [ENV=... ...]
     local label=$1 stage=$2; shift 2
+    if [ -n "$ONLY" ] && [[ " $ONLY " != *" $label "* ]]; then note "$label: skipped (ONLY=\"$ONLY\")"; return 0; fi
     local logf=$LOGS/${label}_$TAG.log
     log "=== $label: stage $stage ($*) -> $logf ==="
     local t=$(date +%s)
@@ -70,6 +82,11 @@ RUN_A=factoryK_$TAG
 RUN_B=sfmrefit_$TAG
 # DBRUN=<tag>: reuse an existing, complete factory-K database instead of building one
 DB_OK=0
+if [ "$RESUME" = 1 ] && [ -z "${DBRUN:-}" ]; then
+    # the resumed launch's own database, or the one it reused (recorded in its run_params.txt)
+    DBRUN=$(sed -n 's|^db=.*/colmap_work_factoryK_\([^/]*\)/database.db$|\1|p' "$ROOT"/data/colmap_work_exp1*_*_$TAG/run_params.txt 2>/dev/null | head -1)
+    [ -n "$DBRUN" ] || DBRUN=factoryK_$TAG
+fi
 if [ -n "${DBRUN:-}" ]; then
     DBF=$ROOT/data/colmap_work_factoryK_$DBRUN/database.db
     if [ -f "$DBF" ] && singularity exec --cleanenv --contain --bind "$ROOT:$ROOT" "${SIF_PY:-$HOME/containers/3dgs.sif}" python - "$DBF" <<'PYEOF'
@@ -90,8 +107,10 @@ if [ $DB_OK = 0 ]; then
     run_stage db db RUN=$RUN_A PRIOR=sparse_mocap_factoryK && DB_OK=1
 fi
 if [ $DB_OK = 1 ]; then
-    run_stage exp10_factoryK exp10 RUN=$RUN_A DBRUN=$RUN_DB PRIOR=sparse_mocap_factoryK || true
+    # most informative first, so a partial run already answers the main question
     run_stage exp11_factoryK exp11 RUN=$RUN_A DBRUN=$RUN_DB PRIOR=sparse_mocap_factoryK || true
+    run_stage exp12_free     exp12 RUN=$RUN_A DBRUN=$RUN_DB PRIOR=sparse_mocap_factoryK || true
+    run_stage exp10_factoryK exp10 RUN=$RUN_A DBRUN=$RUN_DB PRIOR=sparse_mocap_factoryK || true
     run_stage exp10_sfmrefit exp10 RUN=$RUN_B DBRUN=$RUN_DB PRIOR=sparse_mocap_sfmrefit || true
     [ "$EXTRA" = 1 ] && { run_stage exp11_sfmrefit exp11 RUN=$RUN_B DBRUN=$RUN_DB PRIOR=sparse_mocap_sfmrefit || true; }
 else
@@ -100,11 +119,9 @@ fi
 
 note ""
 note "=== results.json ==="
-for n in exp4_colmap_perimage exp6_colmap_guided_r1 exp8_colmap_guided_freefocal_r1 \
-         exp10_guided_${RUN_A}_r1 exp11_pose_prior_${RUN_A}_r1 exp10_guided_${RUN_B}_r1 exp11_pose_prior_${RUN_B}_r1; do
-    if [ -f "$ROOT/output/$n/results.json" ]; then
-        note "--- $n: $(tr -d '\n ' < "$ROOT/output/$n/results.json")"
-    fi
+for f in "$ROOT"/output/exp4_colmap_perimage/results.json "$ROOT"/output/exp6_colmap_guided_r1/results.json \
+         "$ROOT"/output/exp8_colmap_guided_freefocal_r1/results.json "$ROOT"/output/exp1[012]_*_${TAG}*/results.json; do
+    [ -f "$f" ] && note "--- $(basename "$(dirname "$f")"): $(tr -d '\n ' < "$f")"
 done
 note ""
 note "outputs: data/colmap_work_factoryK_$RUN_DB (database), data/colmap_work_exp1{0,1}_$RUN_A, data/colmap_work_exp10_$RUN_B,"
